@@ -75,4 +75,10 @@ describe("classifyWalletError", () => {
     expect(result.kind).toBe("popup");
     expect(result.maybeSent).toBe(false);
   });
+
+  it("falls back to unknown for unclassified error", () => {
+    const result = classifyWalletError("Something completely unexpected");
+    expect(result.kind).toBe("unknown");
+    expect(result.maybeSent).toBe(false);
+  });
 });
