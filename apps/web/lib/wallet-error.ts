@@ -127,7 +127,8 @@ export function classifyWalletError(err: unknown): ClassifiedError {
   if (code === -32002) {
     return {
       kind: "pending",
-      message: "Your wallet already has a request open. Finish or dismiss it there, then try again.",
+      message:
+        "Your wallet already has a request open. Finish or dismiss it there, then try again.",
       maybeSent: false,
       raw,
     };
@@ -145,7 +146,8 @@ export function classifyWalletError(err: unknown): ClassifiedError {
   if (code === 4900 || code === 4901) {
     return {
       kind: "network",
-      message: "Your wallet disconnected from the network. Check your wallet's activity before retrying.",
+      message:
+        "Your wallet disconnected from the network. Check your wallet's activity before retrying.",
       maybeSent: true,
       raw,
     };
@@ -176,7 +178,8 @@ export function classifyWalletError(err: unknown): ClassifiedError {
     if (pattern.test(raw)) {
       return {
         kind: "network",
-        message: "A network error occurred while communicating with the network. Check your wallet's activity before retrying.",
+        message:
+          "A network error occurred while communicating with the network. Check your wallet's activity before retrying.",
         maybeSent: true,
         raw,
       };
@@ -234,9 +237,9 @@ export function classifyWalletError(err: unknown): ClassifiedError {
   // Fallback
   return {
     kind: "unknown",
-    message: raw && raw.length < 150 ? raw : "An unexpected wallet error occurred. Please try again.",
+    message:
+      raw && raw.length < 150 ? raw : "An unexpected wallet error occurred. Please try again.",
     maybeSent: false,
     raw,
   };
 }
-
