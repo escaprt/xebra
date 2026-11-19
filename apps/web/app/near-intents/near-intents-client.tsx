@@ -762,9 +762,7 @@ function Tracker({ tracked, onReset }: { tracked: Tracked; onReset: () => void }
             links={out ? [{ href: deliveryUrl(out), label: "Delivery transaction" }] : []}
           />
         </ol>
-        {statusError && (
-          <Notice tone="alarm" title={statusError} />
-        )}
+        {statusError && <Notice tone="alarm" title={statusError} />}
         <p className="text-xs text-bone/35">
           Deposit address <span className="font-mono text-bone/55">{tracked.depositAddress}</span>
         </p>
