@@ -116,6 +116,34 @@ function proxyConnection(): Connection {
   });
 }
 
+export interface RelayerAnswer {
+  status?: string;
+  hash?: string;
+  reason?: string;
+}
+
+export function nextStellarDelivery(
+  current: Delivery,
+  answer: RelayerAnswer | null | undefined,
+): Delivery {
+  if (current.kind === "done" || current.kind === "stuck") {
+    return current;
+  }
+  if (!answer) {
+    return { kind: "idle" };
+  }
+  if (answer.status === "delivered" || (answer.status === "submitted" && Boolean(answer.hash))) {
+    return { kind: "done", hash: answer.hash ?? null };
+  }
+  if (answer.status === "refused" || answer.status === "failed") {
+    return {
+      kind: "stuck",
+      message: answer.reason ?? "The mint could not be completed.",
+    };
+  }
+  return { kind: "idle" };
+}
+
 export function SolanaBridgeForm({
   config,
   sourcePicker,
@@ -209,9 +237,13 @@ export function SolanaBridgeForm({
 
   // A Stellar-bound burn: ask Circle until it attests, then ask the relayer to finish the mint.
   const completing = useRef(false);
+  const stellarDeliveryRef = useRef(stellarDelivery);
+  stellarDeliveryRef.current = stellarDelivery;
+  const isStellarTerminal = stellarDelivery.kind === "done" || stellarDelivery.kind === "stuck";
+
   useEffect(() => {
     if (!sent || sent.to !== "stellar") return;
-    if (stellarDelivery.kind === "done" || stellarDelivery.kind === "stuck") return;
+    if (isStellarTerminal) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
     const tx = sent.tx;
@@ -245,27 +277,27 @@ export function SolanaBridgeForm({
         if (state === "complete" && config.relayer && !completing.current) {
           completing.current = true;
           setStellarDelivery({ kind: "completing" });
-          const c = await fetch("/api/stellar-inbound/complete", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ src: SOLANA_DOMAIN, tx }),
-          });
-          const result = (await c.json()) as { status?: string; hash?: string; reason?: string };
-          completing.current = false;
-          if (cancelled) return;
-          if (result.status === "delivered" || (result.status === "submitted" && result.hash)) {
-            setStellarDelivery({ kind: "done", hash: result.hash ?? null });
-            remember(null);
-            return;
-          }
-          if (result.status === "refused" || result.status === "failed") {
-            setStellarDelivery({
-              kind: "stuck",
-              message: result.reason ?? "The mint could not be completed.",
+          try {
+            const c = await fetch("/api/stellar-inbound/complete", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ src: SOLANA_DOMAIN, tx }),
             });
-            return;
+            const result = (await c.json()) as RelayerAnswer;
+            const next = nextStellarDelivery(stellarDeliveryRef.current, result);
+            setStellarDelivery(next);
+            if (next.kind === "done") {
+              remember(null);
+              return;
+            }
+            if (next.kind === "stuck") {
+              return;
+            }
+          } catch {
+            setStellarDelivery({ kind: "idle" });
+          } finally {
+            completing.current = false;
           }
-          setStellarDelivery({ kind: "idle" });
         }
       } catch {
         completing.current = false;
@@ -278,7 +310,7 @@ export function SolanaBridgeForm({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [sent, stellarDelivery.kind, config.relayer]);
+  }, [sent, isStellarTerminal, config.relayer]);
 
   const units = parseAmount(amount);
   const tier = health?.tiers.standard ?? null;
