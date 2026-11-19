@@ -55,6 +55,39 @@ const CLAIM_GRACE_MS = 10 * 60_000;
 /** Measured on mainnet: the burn's message account (about 0.003 SOL) and the network fee. */
 const SOL_COST = "about 0.0035 SOL";
 
+export const POLL_FAILURE_THRESHOLD = 5;
+export const POLL_BASE_MS = 5000;
+export const POLL_MAX_MS = 30_000;
+
+export function nextPollDelay(
+  consecutiveFailures: number,
+  baseMs = POLL_BASE_MS,
+  maxMs = POLL_MAX_MS,
+): number {
+  if (consecutiveFailures <= 0) return baseMs;
+  const backoff = baseMs * 2 ** Math.min(consecutiveFailures, 4);
+  return Math.min(backoff, maxMs);
+}
+
+export function shouldShowPollNotice(
+  consecutiveFailures: number,
+  threshold = POLL_FAILURE_THRESHOLD,
+): boolean {
+  return consecutiveFailures >= threshold;
+}
+
+export function isTerminalStellarState(
+  state?: Attest,
+  delivered?: boolean,
+  refusal?: string,
+): boolean {
+  return (state === "complete" && Boolean(delivered)) || (state === "complete" && Boolean(refusal));
+}
+
+export function isTerminalRelayerStatus(status?: string): boolean {
+  return status === "delivered" || status === "refused" || status === "failed";
+}
+
 export type SolanaDestination = "stellar" | EvmChainId;
 
 export interface SolanaSourceConfig {
@@ -148,6 +181,7 @@ export function SolanaBridgeForm({
   const [recipientSeen, setRecipientSeen] = useState<string | null>(null);
   const [claiming, setClaiming] = useState(false);
   const [claimError, setClaimError] = useState<string | null>(null);
+  const [pollError, setPollError] = useState(false);
 
   // A transfer this browser was following comes back on screen.
   useEffect(() => {
@@ -194,7 +228,7 @@ export function SolanaBridgeForm({
       const d = await getDelivery(sent.tx, SOLANA_DOMAIN);
       if (cancelled) return;
       setDelivery(d);
-      if (d.status === "known" && d.state === "delivered") {
+      if (d.status === "known" && (d.state === "delivered" || d.state === "failed")) {
         remember(null);
         return;
       }
@@ -214,12 +248,16 @@ export function SolanaBridgeForm({
     if (stellarDelivery.kind === "done" || stellarDelivery.kind === "stuck") return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
+    let consecutiveFailures = 0;
     const tx = sent.tx;
     async function tick() {
       try {
         const s = await fetch(`/api/solana-source/status?tx=${encodeURIComponent(tx)}`, {
           cache: "no-store",
         });
+        if (!s.ok) {
+          throw new Error(`Status service answered ${s.status}`);
+        }
         const body = (await s.json()) as {
           state?: Attest;
           delivered?: boolean;
@@ -227,6 +265,8 @@ export function SolanaBridgeForm({
           refusal?: string;
         };
         if (cancelled) return;
+        consecutiveFailures = 0;
+        setPollError(false);
         const state: Attest = body.state ?? "unknown";
         setAttest(state);
         if (body.recipient) setRecipientSeen(body.recipient);
@@ -269,9 +309,16 @@ export function SolanaBridgeForm({
         }
       } catch {
         completing.current = false;
-        // A dropped request is not a failed transfer; the next tick asks again.
+        if (cancelled) return;
+        consecutiveFailures += 1;
+        if (shouldShowPollNotice(consecutiveFailures)) {
+          setPollError(true);
+        }
       }
-      if (!cancelled) timer = setTimeout(tick, POLL_MS);
+      if (!cancelled) {
+        const delay = nextPollDelay(consecutiveFailures);
+        timer = setTimeout(tick, delay);
+      }
     }
     void tick();
     return () => {
@@ -342,6 +389,7 @@ export function SolanaBridgeForm({
       const res = await fetch("/api/solana-source/build", {
         method: "POST",
         headers: { "content-type": "application/json" },
+        signal: AbortSignal.timeout(15_000),
         body: JSON.stringify({
           sender: solana.address,
           amount: amount.trim(),
@@ -381,6 +429,13 @@ export function SolanaBridgeForm({
       setStellarDelivery({ kind: "idle" });
       setSent(record);
     } catch (err) {
+      if (
+        (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) ||
+        /timed? ?out|abort/i.test(String(err))
+      ) {
+        setError("Xebra did not answer in time. Nothing was sent.");
+        return;
+      }
       const text = reportError("solana burn failed", err);
       setError(
         /blockhash/i.test(text)
@@ -403,6 +458,7 @@ export function SolanaBridgeForm({
     setClaimError(null);
     setError(null);
     setAmount("");
+    setPollError(false);
   }
 
   async function claim() {
@@ -438,6 +494,13 @@ export function SolanaBridgeForm({
           {heading}
           <div className="px-5 py-6 sm:px-6">
             {sourcePicker}
+            {pollError && (
+              <div className="mb-5">
+                <Notice tone="info" title="We can't reach the status service right now">
+                  Your transfer is safe on chain; this page keeps trying.
+                </Notice>
+              </div>
+            )}
             <Progress
               digest={sent.tx}
               sourceName="Solana"
