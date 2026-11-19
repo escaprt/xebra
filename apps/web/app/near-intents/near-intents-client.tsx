@@ -639,12 +639,28 @@ function deliveryUrl(out: { hash: string; explorerUrl: string }): string {
 const XEBRA_DONE = new Set(["delivered"]);
 const INTENTS_DONE = new Set(["SUCCESS", "REFUNDED", "FAILED"]);
 
+function isTerminal(s: Status | null): boolean {
+  if (!s) return false;
+  const intentsStatus = s.intents?.status?.toUpperCase();
+  if (intentsStatus && (INTENTS_DONE.has(intentsStatus) || intentsStatus === "DELIVERED")) {
+    return true;
+  }
+  if (s.xebra?.state === "failed") return true;
+  return false;
+}
+
 function Tracker({ tracked, onReset }: { tracked: Tracked; onReset: () => void }) {
   const [status, setStatus] = useState<Status | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
 
   useEffect(() => {
     let stop = false;
+    let timerId: ReturnType<typeof setTimeout> | null = null;
+    let consecutiveFailures = 0;
+
     const tick = async () => {
+      if (stop) return;
+      let terminal = false;
       try {
         const q = new URLSearchParams({
           depositAddress: tracked.depositAddress,
@@ -652,16 +668,35 @@ function Tracker({ tracked, onReset }: { tracked: Tracked; onReset: () => void }
           from: tracked.from ?? "stellar",
         });
         const res = await fetch(`/api/near-intents/status?${q}`);
-        if (res.ok && !stop) setStatus((await res.json()) as Status);
+        if (!res.ok) {
+          throw new Error(`Status check failed (${res.status})`);
+        }
+        const data = (await res.json()) as Status;
+        if (!stop) {
+          consecutiveFailures = 0;
+          setStatusError(null);
+          setStatus(data);
+          terminal = isTerminal(data);
+        }
       } catch {
-        // A missed poll is retried on the next tick.
+        if (!stop) {
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= 5) {
+            setStatusError("We can't reach the status service right now");
+          }
+        }
+      }
+
+      if (!stop && !terminal) {
+        const delay = consecutiveFailures >= 5 ? 15000 : 5000;
+        timerId = setTimeout(tick, delay);
       }
     };
+
     void tick();
-    const id = setInterval(tick, 5000);
     return () => {
       stop = true;
-      clearInterval(id);
+      if (timerId) clearTimeout(timerId);
     };
   }, [tracked]);
 
@@ -727,6 +762,9 @@ function Tracker({ tracked, onReset }: { tracked: Tracked; onReset: () => void }
             links={out ? [{ href: deliveryUrl(out), label: "Delivery transaction" }] : []}
           />
         </ol>
+        {statusError && (
+          <Notice tone="alarm" title={statusError} />
+        )}
         <p className="text-xs text-bone/35">
           Deposit address <span className="font-mono text-bone/55">{tracked.depositAddress}</span>
         </p>
