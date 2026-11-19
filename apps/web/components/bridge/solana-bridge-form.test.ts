@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 process.env.NEXT_PUBLIC_NETWORK = "mainnet";
 
-import { type Delivery } from "../../app/sui/sui-client";
+import type { Delivery } from "../../app/sui/sui-client";
 import { nextStellarDelivery } from "./solana-bridge-form";
 
 // Stub client components/hooks if needed for vitest environment
