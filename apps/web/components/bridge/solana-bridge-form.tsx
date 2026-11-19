@@ -19,6 +19,7 @@ import { type DeliveryView, getDelivery, getRouteHealth } from "../../lib/circle
 import { reportError } from "../../lib/format-error";
 import { waitForSignature } from "../../lib/solana-confirm";
 import { claimOnStellar } from "../../lib/sui-stellar/claim-client";
+import { type ClassifiedError, classifyWalletError } from "../../lib/wallet-error";
 import { Button } from "../ui/button";
 import { DataRow } from "../ui/data-row";
 import { Field, Input } from "../ui/field";
@@ -137,7 +138,7 @@ export function SolanaBridgeForm({
   const [amount, setAmount] = useState("");
   const [recipient, setRecipient] = useState("");
   const [step, setStep] = useState<"idle" | "preparing" | "signing" | "confirming">("idle");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ClassifiedError | null>(null);
   const [health, setHealth] = useState<CircleHealth | null>(null);
 
   // A burn on screen: its signature, where it went, when.
@@ -352,7 +353,9 @@ export function SolanaBridgeForm({
       });
       const body = (await res.json()) as { transaction?: string; error?: string };
       if (!res.ok || !body.transaction) {
-        setError(body.error ?? "Could not prepare the transfer.");
+        const classified = classifyWalletError(body.error ?? "Could not prepare the transfer.");
+        reportError("solana prepare failed", classified.raw);
+        setError(classified);
         // A fee that moved is shown again from a fresh quote before anything is signed.
         if (res.status === 409 && chain) {
           setHealth(await getRouteHealth(SOLANA_DOMAIN, chain.cctpDomainId));
@@ -381,12 +384,9 @@ export function SolanaBridgeForm({
       setStellarDelivery({ kind: "idle" });
       setSent(record);
     } catch (err) {
-      const text = reportError("solana burn failed", err);
-      setError(
-        /blockhash/i.test(text)
-          ? "The transaction expired before it was signed: Solana transactions are good for about a minute. Nothing was burned. Send again."
-          : text,
-      );
+      const classified = classifyWalletError(err);
+      reportError("solana burn failed", classified.raw);
+      setError(classified);
     } finally {
       setStep("idle");
     }
@@ -658,11 +658,20 @@ export function SolanaBridgeForm({
             </InsetTray>
           )}
 
-          {error && (
-            <Notice tone="alarm" title="Could not send">
-              {error}
-            </Notice>
-          )}
+          {error &&
+            (error.kind === "declined" || error.kind === "popup" ? (
+              <Notice tone="info" title="Wallet request cancelled">
+                You cancelled in your wallet. Nothing was sent.
+              </Notice>
+            ) : error.maybeSent ? (
+              <Notice tone="alarm" title="Could not confirm transfer">
+                {error.message}
+              </Notice>
+            ) : (
+              <Notice tone="alarm" title="Could not send">
+                {error.message}
+              </Notice>
+            ))}
 
           <Button
             size="lg"
