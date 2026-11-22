@@ -17,8 +17,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { type Attest, type Delivery, Progress } from "../../app/sui/sui-client";
 import { type DeliveryView, getDelivery, getRouteHealth } from "../../lib/circle-status";
 import { reportError } from "../../lib/format-error";
+import {
+  BUILD_TIMED_OUT,
+  fetchBeforeSigning,
+  nextPollDelay,
+  shouldShowPollNotice,
+} from "../../lib/poll-backoff";
 import { waitForSignature } from "../../lib/solana-confirm";
 import { claimOnStellar } from "../../lib/sui-stellar/claim-client";
+import { type ClassifiedError, classifyWalletError } from "../../lib/wallet-error";
 import { Button } from "../ui/button";
 import { DataRow } from "../ui/data-row";
 import { Field, Input } from "../ui/field";
@@ -54,39 +61,6 @@ const HEALTH_MS = 30_000;
 const CLAIM_GRACE_MS = 10 * 60_000;
 /** Measured on mainnet: the burn's message account (about 0.003 SOL) and the network fee. */
 const SOL_COST = "about 0.0035 SOL";
-
-export const POLL_FAILURE_THRESHOLD = 5;
-export const POLL_BASE_MS = 5000;
-export const POLL_MAX_MS = 30_000;
-
-export function nextPollDelay(
-  consecutiveFailures: number,
-  baseMs = POLL_BASE_MS,
-  maxMs = POLL_MAX_MS,
-): number {
-  if (consecutiveFailures <= 0) return baseMs;
-  const backoff = baseMs * 2 ** Math.min(consecutiveFailures, 4);
-  return Math.min(backoff, maxMs);
-}
-
-export function shouldShowPollNotice(
-  consecutiveFailures: number,
-  threshold = POLL_FAILURE_THRESHOLD,
-): boolean {
-  return consecutiveFailures >= threshold;
-}
-
-export function isTerminalStellarState(
-  state?: Attest,
-  delivered?: boolean,
-  refusal?: string,
-): boolean {
-  return (state === "complete" && Boolean(delivered)) || (state === "complete" && Boolean(refusal));
-}
-
-export function isTerminalRelayerStatus(status?: string): boolean {
-  return status === "delivered" || status === "refused" || status === "failed";
-}
 
 export type SolanaDestination = "stellar" | EvmChainId;
 
@@ -200,7 +174,7 @@ export function SolanaBridgeForm({
   const [amount, setAmount] = useState("");
   const [recipient, setRecipient] = useState("");
   const [step, setStep] = useState<"idle" | "preparing" | "signing" | "confirming">("idle");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ClassifiedError | null>(null);
   const [health, setHealth] = useState<CircleHealth | null>(null);
 
   // A burn on screen: its signature, where it went, when.
@@ -259,7 +233,7 @@ export function SolanaBridgeForm({
       const d = await getDelivery(sent.tx, SOLANA_DOMAIN);
       if (cancelled) return;
       setDelivery(d);
-      if (d.status === "known" && (d.state === "delivered" || d.state === "failed")) {
+      if (d.status === "known" && d.state === "delivered") {
         remember(null);
         return;
       }
@@ -421,21 +395,27 @@ export function SolanaBridgeForm({
     setError(null);
     setStep("preparing");
     try {
-      const res = await fetch("/api/solana-source/build", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        signal: AbortSignal.timeout(15_000),
-        body: JSON.stringify({
+      // Only this request, before anything is signed, may time out as "nothing was sent".
+      const built = await fetchBeforeSigning<{ transaction?: string; error?: string }>(
+        "/api/solana-source/build",
+        {
           sender: solana.address,
           amount: amount.trim(),
           recipient: recipient.trim(),
           chain: to,
           maxFee: plan?.ok ? plan.maxFee.toString() : "0",
-        }),
-      });
-      const body = (await res.json()) as { transaction?: string; error?: string };
-      if (!res.ok || !body.transaction) {
-        setError(body.error ?? "Could not prepare the transfer.");
+        },
+      );
+      if (built.timedOut) {
+        reportError("solana prepare timed out", BUILD_TIMED_OUT.raw);
+        setError(BUILD_TIMED_OUT);
+        return;
+      }
+      const { res, body } = built;
+      if (!res.ok || !body?.transaction) {
+        const classified = classifyWalletError(body?.error ?? "Could not prepare the transfer.");
+        reportError("solana prepare failed", classified.raw);
+        setError(classified);
         // A fee that moved is shown again from a fresh quote before anything is signed.
         if (res.status === 409 && chain) {
           setHealth(await getRouteHealth(SOLANA_DOMAIN, chain.cctpDomainId));
@@ -465,19 +445,9 @@ export function SolanaBridgeForm({
       setStellarDelivery({ kind: "idle" });
       setSent(record);
     } catch (err) {
-      if (
-        (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) ||
-        /timed? ?out|abort/i.test(String(err))
-      ) {
-        setError("Xebra did not answer in time. Nothing was sent.");
-        return;
-      }
-      const text = reportError("solana burn failed", err);
-      setError(
-        /blockhash/i.test(text)
-          ? "The transaction expired before it was signed: Solana transactions are good for about a minute. Nothing was burned. Send again."
-          : text,
-      );
+      const classified = classifyWalletError(err);
+      reportError("solana burn failed", classified.raw);
+      setError(classified);
     } finally {
       setStep("idle");
     }
@@ -771,11 +741,20 @@ export function SolanaBridgeForm({
             </InsetTray>
           )}
 
-          {error && (
-            <Notice tone="alarm" title="Could not send">
-              {error}
-            </Notice>
-          )}
+          {error &&
+            (error.kind === "declined" || error.kind === "popup" ? (
+              <Notice tone="info" title="Wallet request cancelled">
+                You cancelled in your wallet. Nothing was sent.
+              </Notice>
+            ) : error.maybeSent ? (
+              <Notice tone="alarm" title="Could not confirm transfer">
+                {error.message}
+              </Notice>
+            ) : (
+              <Notice tone="alarm" title="Could not send">
+                {error.message}
+              </Notice>
+            ))}
 
           <Button
             size="lg"

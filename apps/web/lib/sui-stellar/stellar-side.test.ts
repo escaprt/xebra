@@ -18,7 +18,14 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
     prepareTransaction = prepareTransaction;
     sendTransaction = sendTransaction;
   }
-  return { ...sdk, rpc: { ...sdk.rpc, Server } };
+  return {
+    ...sdk,
+    rpc: {
+      ...sdk.rpc,
+      Server,
+      assembleTransaction: () => ({ build: () => ({ sign: vi.fn() }) }),
+    },
+  };
 });
 
 vi.mock("../env", () => ({
@@ -78,19 +85,25 @@ afterEach(() => {
 describe("completeBurn when the transaction fails on chain", () => {
   it("reports delivered when another instance already completed the same mint", async () => {
     horizonSays(false);
-    // First the recipient's trustline check, then the post-failure mint state check.
-    simulateTransaction.mockResolvedValueOnce(balanceSim).mockResolvedValueOnce(alreadyMinted);
+    // Recipient trustline check, pre-send mint simulation, then post-failure mint state check.
+    simulateTransaction
+      .mockResolvedValueOnce(balanceSim)
+      .mockResolvedValueOnce(stillOpen)
+      .mockResolvedValueOnce(alreadyMinted);
 
     const result = await completeBurn(DIGEST, relayer.secret());
 
     expect(result).toEqual({ status: "delivered" });
     expect(sendTransaction).toHaveBeenCalledTimes(1);
-    expect(simulateTransaction).toHaveBeenCalledTimes(2);
+    expect(simulateTransaction).toHaveBeenCalledTimes(3);
   });
 
   it("still reports failed when the mint has not happened", async () => {
     horizonSays(false);
-    simulateTransaction.mockResolvedValueOnce(balanceSim).mockResolvedValueOnce(stillOpen);
+    simulateTransaction
+      .mockResolvedValueOnce(balanceSim)
+      .mockResolvedValueOnce(stillOpen)
+      .mockResolvedValueOnce(stillOpen);
 
     expect(await completeBurn(DIGEST, relayer.secret())).toEqual({
       status: "failed",
@@ -103,6 +116,7 @@ describe("completeBurn when the transaction fails on chain", () => {
     horizonSays(false);
     simulateTransaction
       .mockResolvedValueOnce(balanceSim)
+      .mockResolvedValueOnce(stillOpen)
       .mockRejectedValueOnce(new Error("rpc down"));
 
     expect(await completeBurn(DIGEST, relayer.secret())).toMatchObject({ status: "failed" });
@@ -112,13 +126,13 @@ describe("completeBurn when the transaction fails on chain", () => {
 describe("completeBurn when the transaction succeeds", () => {
   it("reports submitted and does not re-check the mint state", async () => {
     horizonSays(true);
-    simulateTransaction.mockResolvedValueOnce(balanceSim);
+    simulateTransaction.mockResolvedValueOnce(balanceSim).mockResolvedValueOnce(stillOpen);
 
     expect(await completeBurn(DIGEST, relayer.secret())).toEqual({
       status: "submitted",
       hash: HASH,
       ledger: 4242,
     });
-    expect(simulateTransaction).toHaveBeenCalledTimes(1);
+    expect(simulateTransaction).toHaveBeenCalledTimes(2);
   });
 });
