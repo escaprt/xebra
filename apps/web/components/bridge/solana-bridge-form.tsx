@@ -17,6 +17,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { type Attest, type Delivery, Progress } from "../../app/sui/sui-client";
 import { type DeliveryView, getDelivery, getRouteHealth } from "../../lib/circle-status";
 import { reportError } from "../../lib/format-error";
+import {
+  BUILD_TIMED_OUT,
+  fetchBeforeSigning,
+  nextPollDelay,
+  shouldShowPollNotice,
+} from "../../lib/poll-backoff";
 import { waitForSignature } from "../../lib/solana-confirm";
 import { claimOnStellar } from "../../lib/sui-stellar/claim-client";
 import { type ClassifiedError, classifyWalletError } from "../../lib/wallet-error";
@@ -180,6 +186,7 @@ export function SolanaBridgeForm({
   const [claiming, setClaiming] = useState(false);
   const [claimError, setClaimError] = useState<string | null>(null);
   const [saved, setSaved] = useState(true);
+  const [pollError, setPollError] = useState(false);
 
   // A transfer this browser was following comes back on screen.
   useEffect(() => {
@@ -250,12 +257,16 @@ export function SolanaBridgeForm({
     if (isStellarTerminal) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
+    let consecutiveFailures = 0;
     const tx = sent.tx;
     async function tick() {
       try {
         const s = await fetch(`/api/solana-source/status?tx=${encodeURIComponent(tx)}`, {
           cache: "no-store",
         });
+        if (!s.ok) {
+          throw new Error(`Status service answered ${s.status}`);
+        }
         const body = (await s.json()) as {
           state?: Attest;
           delivered?: boolean;
@@ -263,6 +274,8 @@ export function SolanaBridgeForm({
           refusal?: string;
         };
         if (cancelled) return;
+        consecutiveFailures = 0;
+        setPollError(false);
         const state: Attest = body.state ?? "unknown";
         setAttest(state);
         if (body.recipient) setRecipientSeen(body.recipient);
@@ -305,9 +318,16 @@ export function SolanaBridgeForm({
         }
       } catch {
         completing.current = false;
-        // A dropped request is not a failed transfer; the next tick asks again.
+        if (cancelled) return;
+        consecutiveFailures += 1;
+        if (shouldShowPollNotice(consecutiveFailures)) {
+          setPollError(true);
+        }
       }
-      if (!cancelled) timer = setTimeout(tick, POLL_MS);
+      if (!cancelled) {
+        const delay = nextPollDelay(consecutiveFailures);
+        timer = setTimeout(tick, delay);
+      }
     }
     void tick();
     return () => {
@@ -375,20 +395,25 @@ export function SolanaBridgeForm({
     setError(null);
     setStep("preparing");
     try {
-      const res = await fetch("/api/solana-source/build", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
+      // Only this request, before anything is signed, may time out as "nothing was sent".
+      const built = await fetchBeforeSigning<{ transaction?: string; error?: string }>(
+        "/api/solana-source/build",
+        {
           sender: solana.address,
           amount: amount.trim(),
           recipient: recipient.trim(),
           chain: to,
           maxFee: plan?.ok ? plan.maxFee.toString() : "0",
-        }),
-      });
-      const body = (await res.json()) as { transaction?: string; error?: string };
-      if (!res.ok || !body.transaction) {
-        const classified = classifyWalletError(body.error ?? "Could not prepare the transfer.");
+        },
+      );
+      if (built.timedOut) {
+        reportError("solana prepare timed out", BUILD_TIMED_OUT.raw);
+        setError(BUILD_TIMED_OUT);
+        return;
+      }
+      const { res, body } = built;
+      if (!res.ok || !body?.transaction) {
+        const classified = classifyWalletError(body?.error ?? "Could not prepare the transfer.");
         reportError("solana prepare failed", classified.raw);
         setError(classified);
         // A fee that moved is shown again from a fresh quote before anything is signed.
@@ -440,6 +465,7 @@ export function SolanaBridgeForm({
     setClaimError(null);
     setError(null);
     setAmount("");
+    setPollError(false);
   }
 
   async function claim() {
@@ -475,6 +501,13 @@ export function SolanaBridgeForm({
           {heading}
           <div className="px-5 py-6 sm:px-6">
             {sourcePicker}
+            {pollError && (
+              <div className="mb-5">
+                <Notice tone="info" title="We can't reach the status service right now">
+                  Your transfer is safe on chain; this page keeps trying.
+                </Notice>
+              </div>
+            )}
             <Progress
               digest={sent.tx}
               sourceName="Solana"
