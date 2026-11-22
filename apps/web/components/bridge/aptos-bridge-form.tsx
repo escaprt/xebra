@@ -25,7 +25,11 @@ import {
 import { feeDestination, routeDestination } from "../../lib/route-destination";
 import { type RecipientResolution, resolveRecipient } from "../../lib/solana-recipient";
 import { claimOnStellar } from "../../lib/sui-stellar/claim-client";
-import { type ClassifiedError, classifyWalletError } from "../../lib/wallet-error";
+import {
+  type ClassifiedError,
+  type WalletErrorKind,
+  classifyWalletError,
+} from "../../lib/wallet-error";
 import {
   aptosWalletOnMainnet,
   currentAptosAccount,
@@ -118,6 +122,46 @@ function parseAmount(input: string): bigint | null {
   if (!m) return null;
   const v = BigInt(m[1] ?? "0") * 1_000_000n + BigInt((m[2] ?? "").padEnd(6, "0") || "0");
   return v > 0n ? v : null;
+}
+
+/** A message the form words itself, before the wallet was asked to sign: nothing was sent. */
+function notSent(message: string, kind: WalletErrorKind = "unknown"): ClassifiedError {
+  return { kind, message, maybeSent: false, raw: message };
+}
+
+function withNothingSent(message: string): string {
+  if (/nothing was sent/i.test(message)) return message;
+  const base = message.trim();
+  const sentence = base ? (base.endsWith(".") ? base : `${base}.`) : "";
+  return sentence ? `${sentence} Nothing was sent.` : "Nothing was sent.";
+}
+
+/**
+ * What to say once the wallet had the transaction and threw. A decline stands as it is; anything
+ * else is checked against the account's sequence number (null when it could not be read): moved
+ * past the burn's means it may have gone out, still at or below it means nothing was sent.
+ */
+export function afterWalletError(
+  classified: ClassifiedError,
+  nextSeq: bigint | null,
+  sequenceNumber: bigint,
+): ClassifiedError {
+  if (classified.kind === "declined" || classified.kind === "popup") return classified;
+  if (nextSeq === null) return classified;
+  if (nextSeq > sequenceNumber) {
+    return {
+      ...classified,
+      message: "This transfer may have been sent. Check your wallet before trying again.",
+      maybeSent: true,
+    };
+  }
+  return {
+    ...classified,
+    message: classified.maybeSent
+      ? "The transfer did not go out. Nothing was sent."
+      : withNothingSent(classified.message),
+    maybeSent: false,
+  };
 }
 
 export function AptosBridgeForm({
@@ -252,19 +296,21 @@ export function AptosBridgeForm({
     setError(null);
     const wallet = findAptosWallet(aptos.walletKey);
     if (!wallet) {
-      setError(classifyWalletError("Your Aptos wallet is no longer available. Connect it again."));
+      setError(notSent("Your Aptos wallet is no longer available. Connect it again."));
       return;
     }
     setStep("preparing");
     let senderAddress: string | undefined;
     let envelope: AptosTxEnvelope | undefined;
+    // Set once the wallet has the transaction: only errors after that are the wallet's.
+    let handedOff = false;
     try {
       if ((await aptosWalletOnMainnet(wallet)) === false) {
         setError(
-          classifyWalletError({
-            code: 4902,
-            message: `${wallet.name} is not on Aptos mainnet. Switch it to mainnet, then send again.`,
-          }),
+          notSent(
+            `${wallet.name} is not on Aptos mainnet. Switch it to mainnet, then send again.`,
+            "wrong_network",
+          ),
         );
         return;
       }
@@ -285,15 +331,16 @@ export function AptosBridgeForm({
       });
       if (built.timedOut) {
         reportError("aptos prepare timed out", BUILD_TIMED_OUT.raw);
-        setError({ text: BUILD_TIMED_OUT.message, declined: false });
+        setError(BUILD_TIMED_OUT);
         return;
       }
       const { res } = built;
       const body: NonNullable<typeof built.body> = built.body ?? {};
       if (!res.ok || !body.transaction || !body.envelope) {
-        const classified = classifyWalletError(body.error ?? "Could not prepare the transfer.");
-        reportError("aptos prepare failed", classified.raw);
-        setError(classified);
+        // The server's words, not the wallet's: never read as "you cancelled".
+        const message = body.error ?? "Could not prepare the transfer.";
+        reportError("aptos prepare failed", message);
+        setError(notSent(message));
         // A fee that moved is shown again from a fresh quote before anything is signed.
         if (res.status === 409 && to !== "stellar") {
           const domain = routeDestination(to).cctpDomainId;
@@ -313,36 +360,30 @@ export function AptosBridgeForm({
         chainId: 1,
       };
       setStep("signing");
+      handedOff = true;
       const tx = await signAndSubmitAptos(wallet, args, envelope);
       const r = { tx, to, at: Date.now() };
       const savedOk = remember(r);
       setSaved(savedOk);
       setSent(r);
     } catch (err) {
-      const text = reportError("aptos burn failed", err);
-      const declined = DECLINED.test(text);
-      if (declined) {
-        setError({ text, declined: true });
-      } else if (senderAddress && envelope) {
-        const nextSeq = await readAptosSequenceNumber(senderAddress).catch(() => null);
-        if (nextSeq !== null && nextSeq > envelope.sequenceNumber) {
-          setError({
-            text: "This transfer may have been sent. Check your wallet before trying again.",
-            declined: false,
-          });
-        } else if (nextSeq !== null && nextSeq <= envelope.sequenceNumber) {
-          const base = text.trim();
-          const sentence = base ? (base.endsWith(".") ? base : `${base}.`) : "";
-          setError({
-            text: sentence ? `${sentence} Nothing was sent.` : "Nothing was sent.",
-            declined: false,
-          });
-        } else {
-          setError({ text, declined: false });
-        }
-      } else {
-        setError({ text, declined: false });
+      if (!handedOff) {
+        // Nothing reached the wallet, so nothing was sent; the raw text goes to the console only.
+        reportError("aptos prepare failed", err);
+        setError(notSent("Could not prepare the transfer. Nothing was sent. Try again."));
+        return;
       }
+      const classified = classifyWalletError(err);
+      reportError("aptos burn failed", classified.raw);
+      if (!senderAddress || !envelope) {
+        setError(classified);
+        return;
+      }
+      const nextSeq =
+        classified.kind === "declined" || classified.kind === "popup"
+          ? null
+          : await readAptosSequenceNumber(senderAddress).catch(() => null);
+      setError(afterWalletError(classified, nextSeq, envelope.sequenceNumber));
     } finally {
       setStep("idle");
     }
