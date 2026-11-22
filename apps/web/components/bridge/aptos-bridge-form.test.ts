@@ -1,94 +1,68 @@
 import { describe, expect, it, vi } from "vitest";
 
-vi.mock("../../lib/env", () => ({
-  env: {},
-}));
+process.env.NEXT_PUBLIC_NETWORK = "mainnet";
 
+import type { Delivery } from "../../app/sui/sui-client";
+import { nextDelivery } from "./aptos-bridge-form";
+
+// Stub client components/hooks if needed for vitest environment
 vi.mock("../wallet/wallet-provider", () => ({
-  useWallets: () => ({}),
+  useWallets: () => ({ connections: {} }),
+}));
+vi.mock("../../lib/sui-stellar/claim-client", () => ({
+  claimOnStellar: vi.fn(),
 }));
 
-import {
-  isTerminalRelayerStatus,
-  isTerminalStellarState,
-  nextPollDelay,
-  shouldShowPollNotice,
-} from "./aptos-bridge-form";
+describe("nextDelivery", () => {
+  it("keeps terminal state if already done", () => {
+    const current: Delivery = { kind: "done", hash: "0xabc" };
+    expect(nextDelivery(current, { status: "failed" })).toEqual(current);
+  });
 
-describe("aptos-bridge-form poll helpers", () => {
-  describe("nextPollDelay", () => {
-    it("returns base interval when there are no failures", () => {
-      expect(nextPollDelay(0)).toBe(4000);
-      expect(nextPollDelay(-1)).toBe(4000);
+  it("keeps terminal state if already stuck", () => {
+    const current: Delivery = { kind: "stuck", message: "Error" };
+    expect(nextDelivery(current, { status: "delivered" })).toEqual(current);
+  });
+
+  it("transitions to done when relayer status is delivered", () => {
+    const current: Delivery = { kind: "completing" };
+    expect(nextDelivery(current, { status: "delivered", hash: "0x123" })).toEqual({
+      kind: "done",
+      hash: "0x123",
     });
-
-    it("backs off exponentially on consecutive failures", () => {
-      expect(nextPollDelay(1)).toBe(8000);
-      expect(nextPollDelay(2)).toBe(16_000);
-      expect(nextPollDelay(3)).toBe(30_000);
-    });
-
-    it("caps delay at maxMs", () => {
-      expect(nextPollDelay(4)).toBe(30_000);
-      expect(nextPollDelay(5)).toBe(30_000);
-      expect(nextPollDelay(10)).toBe(30_000);
-    });
-
-    it("respects custom base and max values", () => {
-      expect(nextPollDelay(0, 1000, 8000)).toBe(1000);
-      expect(nextPollDelay(1, 1000, 8000)).toBe(2000);
-      expect(nextPollDelay(2, 1000, 8000)).toBe(4000);
-      expect(nextPollDelay(3, 1000, 8000)).toBe(8000);
-      expect(nextPollDelay(5, 1000, 8000)).toBe(8000);
+    expect(nextDelivery(current, { status: "delivered" })).toEqual({
+      kind: "done",
+      hash: null,
     });
   });
 
-  describe("shouldShowPollNotice", () => {
-    it("does not show notice before the threshold (5 failures)", () => {
-      expect(shouldShowPollNotice(0)).toBe(false);
-      expect(shouldShowPollNotice(1)).toBe(false);
-      expect(shouldShowPollNotice(4)).toBe(false);
-    });
-
-    it("shows notice once reaching or exceeding the threshold", () => {
-      expect(shouldShowPollNotice(5)).toBe(true);
-      expect(shouldShowPollNotice(6)).toBe(true);
-      expect(shouldShowPollNotice(20)).toBe(true);
-    });
-
-    it("respects a custom threshold", () => {
-      expect(shouldShowPollNotice(2, 3)).toBe(false);
-      expect(shouldShowPollNotice(3, 3)).toBe(true);
+  it("transitions to done when relayer status is submitted with a hash", () => {
+    const current: Delivery = { kind: "completing" };
+    expect(nextDelivery(current, { status: "submitted", hash: "0xhash" })).toEqual({
+      kind: "done",
+      hash: "0xhash",
     });
   });
 
-  describe("isTerminalStellarState", () => {
-    it("recognizes completed delivery as terminal", () => {
-      expect(isTerminalStellarState("complete", true, undefined)).toBe(true);
+  it("transitions to stuck with reason when refused or failed", () => {
+    const current: Delivery = { kind: "completing" };
+    expect(
+      nextDelivery(current, { status: "refused", reason: "Circle signature invalid" }),
+    ).toEqual({
+      kind: "stuck",
+      message: "Circle signature invalid",
     });
-
-    it("recognizes refusal as terminal", () => {
-      expect(isTerminalStellarState("complete", false, "Circle rejected message")).toBe(true);
-    });
-
-    it("recognizes pending or incomplete states as non-terminal", () => {
-      expect(isTerminalStellarState("pending", false, undefined)).toBe(false);
-      expect(isTerminalStellarState("unknown", false, undefined)).toBe(false);
-      expect(isTerminalStellarState("complete", false, undefined)).toBe(false);
+    expect(nextDelivery(current, { status: "failed" })).toEqual({
+      kind: "stuck",
+      message: "The mint could not be completed.",
     });
   });
 
-  describe("isTerminalRelayerStatus", () => {
-    it("recognizes terminal statuses", () => {
-      expect(isTerminalRelayerStatus("delivered")).toBe(true);
-      expect(isTerminalRelayerStatus("refused")).toBe(true);
-      expect(isTerminalRelayerStatus("failed")).toBe(true);
-    });
-
-    it("recognizes in-progress statuses as non-terminal", () => {
-      expect(isTerminalRelayerStatus("submitted")).toBe(false);
-      expect(isTerminalRelayerStatus("pending")).toBe(false);
-      expect(isTerminalRelayerStatus(undefined)).toBe(false);
-    });
+  it("returns idle on missing or unrecognized answer to allow retry", () => {
+    const current: Delivery = { kind: "completing" };
+    expect(nextDelivery(current, null)).toEqual({ kind: "idle" });
+    expect(nextDelivery(current, undefined)).toEqual({ kind: "idle" });
+    expect(nextDelivery(current, { status: "pending" })).toEqual({ kind: "idle" });
+    expect(nextDelivery(current, { status: "submitted" })).toEqual({ kind: "idle" });
   });
 });
