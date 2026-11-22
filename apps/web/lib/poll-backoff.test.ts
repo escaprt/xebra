@@ -57,7 +57,9 @@ const hangs: typeof fetch = (_url, init) =>
 
 describe("fetchBeforeSigning", () => {
   it("returns the answer and its body", async () => {
-    const f = vi.fn(async () => Response.json({ transaction: "abc" }));
+    const f = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) =>
+      Response.json({ transaction: "abc" }),
+    );
     const r = await fetchBeforeSigning<{ transaction: string }>("/api/x/build", { a: 1 }, 1000, f);
     expect(r).toMatchObject({ timedOut: false, body: { transaction: "abc" } });
     const init = f.mock.calls[0]?.[1] as RequestInit;
