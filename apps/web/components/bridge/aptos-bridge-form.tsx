@@ -16,6 +16,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type Attest, type Delivery, Progress } from "../../app/sui/sui-client";
 import { type DeliveryView, getDelivery, getRouteHealth } from "../../lib/circle-status";
 import { reportError } from "../../lib/format-error";
+import {
+  BUILD_TIMED_OUT,
+  fetchBeforeSigning,
+  nextPollDelay,
+  shouldShowPollNotice,
+} from "../../lib/poll-backoff";
 import { feeDestination, routeDestination } from "../../lib/route-destination";
 import { type RecipientResolution, resolveRecipient } from "../../lib/solana-recipient";
 import { claimOnStellar } from "../../lib/sui-stellar/claim-client";
@@ -53,43 +59,10 @@ import { CopyButton, SubmittedNotice } from "./receipt";
 const APTOS_DOMAIN = 9;
 const STORAGE_KEY = "xebra.aptos.transfer";
 const HASH = /^0x[0-9a-f]{64}$/;
+const POLL_MS = 4_000;
 const HEALTH_MS = 30_000;
 /** Iris can show the attestation a moment before it shows the delivery under way. */
 const CLAIM_GRACE_MS = 10 * 60_000;
-
-export const POLL_FAILURE_THRESHOLD = 5;
-export const POLL_BASE_MS = 4_000;
-export const POLL_MAX_MS = 30_000;
-const POLL_MS = POLL_BASE_MS;
-
-export function nextPollDelay(
-  consecutiveFailures: number,
-  baseMs = POLL_BASE_MS,
-  maxMs = POLL_MAX_MS,
-): number {
-  if (consecutiveFailures <= 0) return baseMs;
-  const backoff = baseMs * 2 ** Math.min(consecutiveFailures, 4);
-  return Math.min(backoff, maxMs);
-}
-
-export function shouldShowPollNotice(
-  consecutiveFailures: number,
-  threshold = POLL_FAILURE_THRESHOLD,
-): boolean {
-  return consecutiveFailures >= threshold;
-}
-
-export function isTerminalStellarState(
-  state?: Attest,
-  delivered?: boolean,
-  refusal?: string,
-): boolean {
-  return (state === "complete" && Boolean(delivered)) || (state === "complete" && Boolean(refusal));
-}
-
-export function isTerminalRelayerStatus(status?: string): boolean {
-  return status === "delivered" || status === "refused" || status === "failed";
-}
 
 export type AptosDestination = EvmChainId | "solana" | "stellar";
 
@@ -300,23 +273,25 @@ export function AptosBridgeForm({
       // The account the wallet will sign with now, which may not be the one it connected with.
       const sender = (await currentAptosAccount(wallet)) ?? aptos.address;
       senderAddress = sender;
-      const res = await fetch("/api/aptos/build", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        signal: AbortSignal.timeout(15_000),
-        body: JSON.stringify({
-          sender,
-          amount: amount.trim(),
-          to,
-          recipient: recipient.trim(),
-          ...(plan?.ok ? { maxFee: plan.maxFee.toString() } : {}),
-        }),
-      });
-      const body = (await res.json().catch(() => ({}))) as {
+      // Only this request, before anything is signed, may time out as "nothing was sent".
+      const built = await fetchBeforeSigning<{
         error?: string;
         transaction?: { arguments: Parameters<typeof aptosBurnArgsFromJson>[0] };
         envelope?: Record<keyof Omit<AptosTxEnvelope, "sender" | "chainId">, string>;
-      };
+      }>("/api/aptos/build", {
+        sender,
+        amount: amount.trim(),
+        to,
+        recipient: recipient.trim(),
+        ...(plan?.ok ? { maxFee: plan.maxFee.toString() } : {}),
+      });
+      if (built.timedOut) {
+        reportError("aptos prepare timed out", BUILD_TIMED_OUT.raw);
+        setError({ text: BUILD_TIMED_OUT.message, declined: false });
+        return;
+      }
+      const { res } = built;
+      const body: NonNullable<typeof built.body> = built.body ?? {};
       if (!res.ok || !body.transaction || !body.envelope) {
         setError({ text: body.error ?? "Could not prepare the transfer.", declined: false });
         // A fee that moved is shown again from a fresh quote before anything is signed.
@@ -344,16 +319,6 @@ export function AptosBridgeForm({
       setSaved(savedOk);
       setSent(r);
     } catch (err) {
-      if (
-        (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) ||
-        /timed? ?out|abort/i.test(String(err))
-      ) {
-        setError({
-          text: "Xebra did not answer in time. Nothing was sent.",
-          declined: false,
-        });
-        return;
-      }
       const text = reportError("aptos burn failed", err);
       const declined = DECLINED.test(text);
       if (declined) {
@@ -608,7 +573,7 @@ function Forwarded({
       const d = await getDelivery(tx, APTOS_DOMAIN);
       if (cancelled) return;
       setDelivery(d);
-      if (d.status === "known" && (d.state === "delivered" || d.state === "failed")) {
+      if (d.status === "known" && d.state === "delivered") {
         remember(null);
         return;
       }
@@ -755,16 +720,16 @@ function ToStellar({
         setAttest(state);
         if (body.recipient) setRecipient(body.recipient);
 
-        if (isTerminalStellarState(state, body.delivered, body.refusal)) {
-          if (body.delivered) {
-            setDelivery({ kind: "done", hash: null });
-            remember(null);
-          } else {
-            setDelivery({
-              kind: "stuck",
-              message: `This burn cannot be completed on Stellar (${body.refusal}).`,
-            });
-          }
+        if (state === "complete" && body.delivered) {
+          setDelivery({ kind: "done", hash: null });
+          remember(null);
+          return;
+        }
+        if (state === "complete" && body.refusal) {
+          setDelivery({
+            kind: "stuck",
+            message: `This burn cannot be completed on Stellar (${body.refusal}).`,
+          });
           return;
         }
         if (state === "complete" && relayerEnabled && !completing.current) {
@@ -801,7 +766,7 @@ function ToStellar({
         }
       }
       if (!cancelled) {
-        const delay = nextPollDelay(consecutiveFailures);
+        const delay = nextPollDelay(consecutiveFailures, POLL_MS);
         timer = setTimeout(tick, delay);
       }
     }
